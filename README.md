@@ -26,11 +26,11 @@ type CliOutput = {
     message: string
 } | {
     type: 'code',
-    message: {
+    message: Array<{
         language: string,
         code: string,
         file_path?: string
-    }
+    }>
 };
 ```
 
