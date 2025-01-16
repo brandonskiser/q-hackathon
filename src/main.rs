@@ -6,7 +6,7 @@ use aws_sdk_bedrockruntime::{
     types::{ContentBlock, ConversationRole, Message as BedrockMessage, SystemContentBlock},
     Client,
 };
-use std::{fs::File, io::IsTerminal};
+use std::{fs::File, io::IsTerminal, path::Path};
 use thiserror::Error;
 use tokio::{io::AsyncReadExt, time::Instant};
 
@@ -24,8 +24,10 @@ struct Cli {
     #[arg(name = "PROMPT")]
     prompt: Vec<String>,
     // /// The directory to include as additional context.
-    // #[arg(short, long)]
-    // directory: Option<String>,
+    #[arg(short, long)]
+    ctx: Option<String>,
+    #[arg(short, long)]
+    file_ctx: Option<Vec<String>>,
 }
 
 const SYSTEM_PROMPT: &str = r#"\
@@ -50,7 +52,7 @@ If the user is asking a question, then ignore all of the instructions below and 
   "additionalProperties": false
 }
 
-If the user is making a request, then your response should be a JSON object according to the following schema:
+If the user is making a request, then your response should be a JSON object according to the following schema. Do not include anything else other than this JSON as specified by the following schema:
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
@@ -121,13 +123,30 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let mut stdin = tokio::io::stdin();
-    let context = if std::io::stdin().is_terminal() {
+    let mut context = if std::io::stdin().is_terminal() {
         String::new()
     } else {
         let mut buf = Vec::with_capacity(256);
         stdin.read_to_end(&mut buf).await?;
         String::from_utf8_lossy(&buf).to_string()
     };
+    let file_ctx = cli.file_ctx;
+    if let Some(file_ctx) = file_ctx {
+        for ctx in file_ctx {
+            let path = Path::new(&ctx);
+            if path.is_file() {
+                let buf = tokio::fs::read_to_string(path).await;
+                if let Ok(buf) = buf {
+                    context.push_str(&buf);
+                } else {
+                    info!(
+                        "{} is not a file, skipping.",
+                        path.to_str().unwrap_or("bad path")
+                    );
+                }
+            }
+        }
+    }
 
     let prompt = cli.prompt.join(" ");
 
@@ -271,24 +290,9 @@ impl AiClient for BedrockClient {
 
                 #[allow(clippy::manual_strip)]
                 // Check if the model responded with code.
-                if text.starts_with("```") {
-                    debug!("Received code response.");
-                    match (text.find("\n"), text[3..].find("```")) {
-                        (Some(code_start), Some(code_end)) => {
-                            assert!(code_start < code_end);
-                            let language = text[3..code_start].into();
-                            let code = text[(code_start + 1)..(code_end + 3)].into();
-                            Ok(SendMessageResponse::Code { language, code })
-                        }
-                        _ => Err(SendMessageError::MalformedCode(text.into())),
-                    }
-                }
                 // Otherwise, response should be a user-facing chat message.
-                else {
-                    debug!("Received chat form response.");
-                    println!("{}", text);
-                    Ok(SendMessageResponse::Chat(text.into()))
-                }
+                debug!("Received chat form response.");
+                Ok(SendMessageResponse::Chat(text.into()))
             }
             Err(err) => match err {
                 aws_smithy_runtime_api::client::result::SdkError::ServiceError(service_error) => {
