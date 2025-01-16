@@ -6,6 +6,7 @@ use aws_sdk_bedrockruntime::{
     types::{ContentBlock, ConversationRole, Message as BedrockMessage, SystemContentBlock},
     Client,
 };
+use serde::{Deserialize, Serialize};
 use std::{fs::File, io::IsTerminal, path::Path};
 use thiserror::Error;
 use tokio::{io::AsyncReadExt, time::Instant};
@@ -28,6 +29,22 @@ struct Cli {
     ctx: Option<String>,
     #[arg(short, long)]
     file_ctx: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+enum ModelResponseType {
+    #[serde(rename = "chat")]
+    #[default]
+    Chat,
+    #[serde(rename = "code")]
+    Code,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ModelResponse {
+    #[serde(rename = "type")]
+    type_: ModelResponseType,
+    message: String,
 }
 
 const SYSTEM_PROMPT: &str = r#"\
@@ -288,11 +305,10 @@ impl AiClient for BedrockClient {
                     .as_text()
                     .map_err(|_| SendMessageError::Custom("Model response was not text".into()))?;
 
-                #[allow(clippy::manual_strip)]
-                // Check if the model responded with code.
-                // Otherwise, response should be a user-facing chat message.
-                debug!("Received chat form response.");
-                Ok(SendMessageResponse::Chat(text.into()))
+                match serde_json::from_str::<ModelResponse>(text) {
+                    Ok(_) => Ok(SendMessageResponse::Chat(text.into())),
+                    _ => Err(SendMessageError::MalformedCode(text.into())),
+                }
             }
             Err(err) => match err {
                 aws_smithy_runtime_api::client::result::SdkError::ServiceError(service_error) => {
