@@ -12,6 +12,8 @@ local state = {
         open = false,
         chat_win = -1,
         prompt_win = -1,
+        conv_id = nil,
+        messages = {}
     },
 }
 
@@ -39,7 +41,7 @@ local MOCK_RES = [[
     ]
 }
 ]]
-local function mock_res()
+local function mock_code_res()
     local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
     lines[#lines + 1] = "hello"
     return vim.json.encode({
@@ -51,6 +53,30 @@ local function mock_res()
             }
         }
     })
+end
+
+local MOCK_CHAT_RES = [[
+{
+    "type": "code",
+    "message": [
+        {
+            "role": "system",
+            "message": "Hello\\nI am a highly intelligent AI, well-versed in the arts of computer programming.\\nPlease feel free to ask me anything about your code!"
+        },
+        {
+            "role": "user",
+            "message": "how do you write hello app in bash"
+        },
+        {
+            "role": "system",
+            "message": "You can write a \"Hello, World!\" app by using the following program:\\n\\n```bash\\n#!/usr/bin/env bash\\n\\necho 'Hello, World!'\\n```\\n"
+        }
+
+    ]
+}
+]]
+local function mock_chat_res()
+    return MOCK_CHAT_RES
 end
 
 local mock_code_invalid_json = [[
@@ -87,6 +113,13 @@ end
 ---@param opts CallOpts
 ---@return vim.SystemCompleted
 local function call_chat(opts)
+    if MOCK then
+        return {
+            code = 0,
+            signal = 0,
+            stdout = mock_chat_res()
+        }
+    end
     local cmd_result = vim.system({ cmd_path, 'chat', opts.prompt },
         {
             text = true,
@@ -96,7 +129,29 @@ local function call_chat(opts)
     return cmd_result
 end
 
+---@class ChatObject
+---@field role string
+---@field message string
+
+---@class ChatResponse
+---@field type 'chat'
+---@field message ChatObject[]
+
+---@param prompt string
+---@return ChatResponse? chat_response
 local function make_chat_request(prompt)
+    local curr_buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    local cmd_result = call_chat({ prompt = prompt, stdin = curr_buf })
+    if cmd_result.code ~= 0 then
+        error('chat command failed with code: ' .. cmd_result.code .. '. stderr: ' .. cmd_result.stderr)
+        return
+    end
+    return vim.json.decode(cmd_result.stdout)
+end
+
+---@return string
+local function gen_new_conv_id()
+    return tostring(vim.fn.rand())
 end
 
 ---Calls the binary for a code modification request.
@@ -107,7 +162,7 @@ local function call_code(opts)
         return {
             code = 0,
             signal = 0,
-            stdout = mock_res()
+            stdout = mock_code_res()
         }
     end
     local cmd_result = vim.system({ cmd_path, '--code', opts.prompt },
@@ -131,18 +186,47 @@ end
 ---Makes a request using the provided prompt.
 ---@param prompt string
 ---@return CodeResponse? code_response `CodeResponse` if successful, otherwise `nil`
-local function code_request(prompt)
+local function make_code_request(prompt)
     local curr_buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)
     local cmd_result = call_code({ prompt = prompt, stdin = curr_buf })
     if cmd_result.code ~= 0 then
-        error('command failed with code: ' .. cmd_result.code .. '. stderr: ' .. cmd_result.stderr)
+        error('code command failed with code: ' .. cmd_result.code .. '. stderr: ' .. cmd_result.stderr)
         return
     end
     return vim.json.decode(cmd_result.stdout)
 end
 
+---Converts a message history table to buffer lines for the chat buffer.
+---@param messages ChatObject[]
+local function chat_messages_to_lines(messages)
+    local lines = {}
+    for _, v in ipairs(messages) do
+        lines[#lines + 1] = '# ' .. v.role
+        local msg_lines = vim.fn.split(v.message, "\\\\n", false)
+        for _, line in ipairs(msg_lines) do
+            lines[#lines + 1] = line
+        end
+        lines[#lines + 1] = ""
+    end
+    return lines
+end
+
 ---Sends the prompt currently stored in the chat prompt window, if not empty.
 local function send_prompt()
+    local prompt_buf = vim.fn.winbufnr(state.chat.prompt_win)
+    local prompt = vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false)[1]
+    local ok, response = pcall(make_chat_request, prompt)
+    if not ok or not response then return end
+
+    state.chat.messages = response.message
+    local lines = chat_messages_to_lines(response.message)
+
+    local chat_buf = vim.fn.winbufnr(state.chat.chat_win)
+    vim.bo[chat_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(chat_buf, 0, -1, false, lines)
+    vim.bo[chat_buf].modifiable = false
+    vim.api.nvim_buf_set_lines(prompt_buf, 0, -1, false, {})
+    vim.cmd('stopinsert')
 end
 
 
@@ -220,15 +304,19 @@ function M.setup(opts)
             vim.keymap.set('n', '<C-k>', function() vim.api.nvim_set_current_win(state.chat.chat_win) end,
                 { desc = 'move to chat window', buffer = prompt_buf })
             vim.keymap.set('i', '<CR>', function()
-                local prompt = vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false)
-                debug('Sending: ' .. prompt[1])
-                vim.api.nvim_buf_set_lines(prompt_buf, 0, -1, false, {})
+                send_prompt()
             end, { desc = 'send prompt', buffer = prompt_buf })
 
-            local prompt = tab.args
-            if prompt ~= '' then
-                local ok, result = pcall(make_chat_request, prompt)
-                if not ok or not result then end
+
+            if state.chat.conv_id == nil or tab.args == 'new' then
+                local conv_id = gen_new_conv_id()
+                debug('conv id: ' .. conv_id)
+                state.chat.conv_id = conv_id
+            else
+                local lines = chat_messages_to_lines(state.chat.messages)
+                vim.bo[chat_buf].modifiable = true
+                vim.api.nvim_buf_set_lines(chat_buf, 0, -1, false, lines)
+                vim.bo[chat_buf].modifiable = false
             end
         end,
         {
@@ -247,7 +335,7 @@ function M.setup(opts)
                 return
             end
 
-            local ok, response = pcall(code_request, prompt)
+            local ok, response = pcall(make_code_request, prompt)
             if not ok or not response then return end
 
             -- create a new buffer to display the results
