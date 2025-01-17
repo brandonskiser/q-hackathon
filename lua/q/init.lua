@@ -20,7 +20,7 @@ local state = {
 local CODE_AUGROUP_NAME = 'q-ai-code'
 local CHAT_AUGROUP_NAME = 'q-ai-chat'
 
-local MOCK = true
+local MOCK = false
 local TEST_FAILURE = false
 
 local cmd_name = "hackathon"
@@ -165,7 +165,7 @@ local function call_code(opts)
             stdout = mock_code_res()
         }
     end
-    local cmd_result = vim.system({ cmd_path, '--code', opts.prompt },
+    local cmd_result = vim.system({ cmd_path, 'code', opts.prompt },
         {
             text = true,
             stdin = opts.stdin,
@@ -336,7 +336,11 @@ function M.setup(opts)
             end
 
             local ok, response = pcall(make_code_request, prompt)
-            if not ok or not response then return end
+            if not ok or not response then
+                debug('request failed!' .. response)
+                return
+            end
+            debug('received response: ' .. vim.inspect(response))
 
             -- create a new buffer to display the results
             local ai_buf = vim.api.nvim_create_buf(false, true)

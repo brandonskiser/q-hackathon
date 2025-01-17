@@ -10,7 +10,12 @@ use aws_sdk_bedrockruntime::{
     error::SdkError, operation::converse::ConverseError, types::SystemContentBlock, Client,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::IsTerminal, path::Path, sync::Arc};
+use std::{
+    fs::File,
+    io::{IsTerminal, Write},
+    path::Path,
+    sync::Arc,
+};
 use thiserror::Error;
 use tokio::{io::AsyncReadExt, sync::Mutex, time::Instant};
 
@@ -140,6 +145,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_writer(file).init();
 
     let cli = Cli::parse();
+
+    debug!("Executing command: {:?}", cli);
 
     match cli.command {
         Commands::Chat(args) => execute_chat(args).await?,
