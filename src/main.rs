@@ -6,13 +6,16 @@ use aws_sdk_bedrockruntime::{
     types::{ContentBlock, ConversationRole, Message as BedrockMessage, SystemContentBlock},
     Client,
 };
-use serde::{Deserialize, Serialize};
-use std::{fs::File, io::IsTerminal, path::Path};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::{borrow::BorrowMut, fs::File, io::IsTerminal, path::Path, sync::Arc};
 use thiserror::Error;
-use tokio::{io::AsyncReadExt, time::Instant};
+use tokio::{io::AsyncReadExt, sync::Mutex, time::Instant};
 
 use clap::Parser;
 use tracing::{debug, error, info};
+
+mod system_prompts;
+use system_prompts::SYSTEM_PROMPT;
 
 /// Simple program?
 #[derive(Parser, Debug)]
@@ -24,113 +27,112 @@ use tracing::{debug, error, info};
 struct Cli {
     #[arg(name = "PROMPT")]
     prompt: Vec<String>,
-    // /// The directory to include as additional context.
-    #[arg(short, long)]
-    ctx: Option<String>,
     #[arg(short, long)]
     file_ctx: Option<Vec<String>>,
+    #[arg(short, long)]
+    resume_chat_ctx: Option<String>,
+    #[arg(short, long)]
+    current_repo_dir: String,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Debug)]
 enum ModelResponseType {
-    #[serde(rename = "chat")]
     #[default]
+    #[serde(rename = "chat")]
     Chat,
     #[serde(rename = "code")]
     Code,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+impl std::fmt::Display for ModelResponseType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelResponseType::Chat => write!(f, "chat"),
+            ModelResponseType::Code => write!(f, "code"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Debug)]
 struct ModelResponse {
     #[serde(rename = "type")]
     type_: ModelResponseType,
-    message: String,
+    // #[serde(deserialize_with = "deserialize_with_escaped_newline")]
+    message: Vec<String>,
 }
 
-const SYSTEM_PROMPT: &str = r#"\
-You are Q, an expert programmer. You are an assistant who can answer questions about code, and generate code when a request is made by the user.
-
-First, decide if the user is asking a question or making a request. When deciding if the user is asking a question, you should only consider the text passed within the <prompt /> tags, and not anything sent before then. For instance, if the user message includes a lot of code but the prompt is asking a question, then the user is asking a question.
-
-If the user is asking a question, then ignore all of the instructions below and respond to the user in chat form. Your response should be a JSON object according to the following JSON schema:
-{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "required": ["type", "message"],
-  "properties": {
-    "type": {
-      "type": "string",
-      "const": "chat"
-    },
-    "message": {
-      "type": "string"
-    }
-  },
-  "additionalProperties": false
+// -----------------------------------------------------------------------------------------------
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct StorableMessage {
+    role: String,
+    content: String,
 }
 
-If the user is making a request, then your response should be a JSON object according to the following schema. Do not include anything else other than this JSON as specified by the following schema:
-{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "required": ["type", "message"],
-  "properties": {
-    "type": {
-      "type": "string",
-      "const": "code"
-    },
-    "message": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["language", "code"],
-        "properties": {
-          "language": {
-            "type": "string",
-            "description": "Programming language identifier for the code block"
-          },
-          "code": {
-            "type": "string",
-            "description": "A valid code block written in the programming language specified by the 'language' field"
-          },
-          "file_path": {
-            "type": "string",
-            "description": "Optional file path where the code should be saved"
-          }
-        },
-        "additionalProperties": false
-      }
-    }
-  },
-  "additionalProperties": false
-}
-The code should be functional, correct, efficient, and include comments where applicable. The code should adhere to best practices in whatever language the user has provided.
-
-Your code should be an updated version of the code provided by the user. For example, if you are not modifying the user's code but instead adding something on top or below it, the user's code should be included in your response.
-
-An example is provided below:
-<example>
-<user>
-pub fn add(x: f32, y: f32) -> f32 {
-    x + y
+// This represents the Anthropic/Claude message format for Bedrock
+#[derive(Serialize, Deserialize)]
+struct AnthropicMessage {
+    role: String,
+    content: Vec<AnthropicContent>,
 }
 
-<prompt>Generate tests</prompt>
-</user>
+#[derive(Serialize, Deserialize)]
+struct AnthropicContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    text: String,
+}
 
-<assistant>
-{
-    "type": "code",
-    "message": [
-        {
-            "language": "rust",
-            "code": "pub fn add(x: f32, y: f32) -> f32 {\n    x + y\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn test_add_positive_numbers() {\n        assert_eq!(add(2.5, 3.7), 6.2);\n    }\n\n    #[test]\n    fn test_add_negative_numbers() {\n        assert_eq!(add(-4.1, -1.3), -5.4);\n    }\n\n    #[test]\n    fn test_add_zero() {\n        assert_eq!(add(0.0, 0.0), 0.0);\n    }\n\n    #[test]\n    fn test_add_small_numbers() {\n        assert_eq!(add(0.00001, 0.00002), 0.00003);\n    }\n}"
+impl From<&StorableMessage> for AnthropicMessage {
+    fn from(msg: &StorableMessage) -> Self {
+        AnthropicMessage {
+            role: msg.role.clone(),
+            content: vec![AnthropicContent {
+                content_type: "text".to_string(),
+                text: msg.content.clone(),
+            }],
         }
-    ]
+    }
 }
-</assistant>
-</example>
-"#;
+
+impl From<AnthropicMessage> for StorableMessage {
+    fn from(msg: AnthropicMessage) -> Self {
+        let content = msg
+            .content
+            .into_iter()
+            .map(|c| c.text)
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        StorableMessage {
+            role: msg.role,
+            content,
+        }
+    }
+}
+
+impl Into<aws_sdk_bedrockruntime::types::ContentBlock> for &AnthropicContent {
+    fn into(self) -> aws_sdk_bedrockruntime::types::ContentBlock {
+        aws_sdk_bedrockruntime::types::ContentBlock::Text(self.text.clone())
+    }
+}
+
+impl TryInto<aws_sdk_bedrockruntime::types::Message> for &AnthropicMessage {
+    type Error = anyhow::Error;
+    fn try_into(self) -> Result<aws_sdk_bedrockruntime::types::Message, Self::Error> {
+        Ok(aws_sdk_bedrockruntime::types::Message::builder()
+            .role(match self.role.as_str() {
+                "user" => aws_sdk_bedrockruntime::types::ConversationRole::User,
+                _ => aws_sdk_bedrockruntime::types::ConversationRole::Assistant,
+            })
+            .set_content(Some(
+                self.content
+                    .iter()
+                    .map(|c| c.into())
+                    .collect::<Vec<aws_sdk_bedrockruntime::types::ContentBlock>>(),
+            ))
+            .build()?)
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -138,6 +140,11 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_writer(file).init();
 
     let cli = Cli::parse();
+    let current_repo_dir = Path::new(&cli.current_repo_dir);
+    if !current_repo_dir.is_dir() {
+        anyhow::bail!("current repo directory given is invalid");
+    }
+    tokio::fs::create_dir(Path::join(current_repo_dir, ".db")).await?;
 
     let mut stdin = tokio::io::stdin();
     let mut context = if std::io::stdin().is_terminal() {
@@ -166,11 +173,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let prompt = cli.prompt.join(" ");
+    let resume_ctx = cli.resume_chat_ctx.as_ref().map(Path::new);
 
-    info!("Prompt: {}", prompt);
     info!("Context: {:?}", context);
 
-    let client = new_bedrock_client().await;
+    let client = BedrockClient::from_id(resume_ctx, current_repo_dir).await;
 
     let response = {
         let start = Instant::now();
@@ -193,18 +200,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    client.store_conversation().await?;
+
     Ok(())
 }
 
-async fn new_bedrock_client() -> impl AiClient {
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
-        .region(CLAUDE_REGION)
-        .load()
-        .await;
-
-    let client = Client::new(&sdk_config);
-
-    BedrockClient { client }
+async fn retrieve_existing_convo_context(id: &Path) -> anyhow::Result<String> {
+    if !id.is_file() {
+        anyhow::bail!("id given is not a file");
+    }
+    Ok(tokio::fs::read_to_string(id).await?)
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +253,8 @@ pub enum SendMessageResponse {
 #[derive(Debug)]
 pub struct BedrockClient {
     client: Client,
+    conversation_history: Arc<Mutex<Vec<StorableMessage>>>,
+    conversation_id: Option<String>,
 }
 
 impl BedrockClient {
@@ -258,7 +265,66 @@ impl BedrockClient {
             .await;
         let client = Client::new(&sdk_config);
 
-        Self { client }
+        Self {
+            client,
+            conversation_history: Arc::new(Mutex::new(Vec::new())),
+            conversation_id: None,
+        }
+    }
+
+    pub async fn from_id(convo_id: Option<&Path>, repo_dir: &Path) -> Self {
+        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+            .region(CLAUDE_REGION)
+            .load()
+            .await;
+        let client = Client::new(&sdk_config);
+
+        let bedrock_client = Self {
+            client,
+            conversation_history: Arc::new(Mutex::new(Vec::new())),
+            conversation_id: Some(".db/some_unique_id".to_string()),
+        };
+
+        if let Some(convo_id) = convo_id {
+            if convo_id.is_file() {
+                if let Ok(ctx_buf) = tokio::fs::read_to_string(convo_id).await {
+                    if let Ok(mut previous_messages) =
+                        serde_json::from_str::<Vec<StorableMessage>>(&ctx_buf)
+                    {
+                        let mut history = bedrock_client.conversation_history.lock().await;
+                        history.append(&mut previous_messages);
+                    }
+                }
+            } else if let Err(e) = tokio::fs::File::create(convo_id).await {
+                panic!("Cannot create context file: {}", e);
+            }
+        } else if let Err(e) =
+            tokio::fs::File::create(Path::join(repo_dir, ".db/some_unique_id")).await
+        {
+            panic!("Cannot create context file: {}", e);
+        }
+
+        bedrock_client
+    }
+
+    pub async fn store_conversation(&self) -> anyhow::Result<()> {
+        println!("running store conversation");
+        if let Some(ctx_file_path) = &self.conversation_id {
+            let json = serde_json::to_string_pretty(&*self.conversation_history.lock().await)?;
+            println!("*****json to be written is: {}", json);
+            tokio::fs::write(ctx_file_path, json).await?;
+            return Ok(());
+        }
+        anyhow::bail!("Error storing conversation. Ctx file path not provided");
+    }
+
+    pub async fn load_conversation<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
+        let json = tokio::fs::read_to_string(path).await?;
+        let mut history = self.conversation_history.lock().await;
+        let new_history = serde_json::from_str::<Vec<StorableMessage>>(&json)?;
+        std::mem::take(&mut *history);
+        *history = new_history;
+        Ok(())
     }
 }
 
@@ -268,21 +334,33 @@ impl AiClient for BedrockClient {
         &self,
         message: Message,
     ) -> Result<SendMessageResponse, SendMessageError> {
+        let mut history = self.conversation_history.lock().await;
+        let mut prompt = String::new();
+        if !message.free_context.is_empty() {
+            prompt.push_str(&format!("{}\n", message.free_context));
+        }
+        prompt.push_str(&message.prompt);
+        history.push(StorableMessage {
+            role: "user".to_string(),
+            content: prompt,
+        });
+        let messages = {
+            history
+                .iter()
+                .filter_map(|m| {
+                    let anth_msg: AnthropicMessage = m.into();
+                    let br_msg: Result<aws_sdk_bedrockruntime::types::Message, _> =
+                        (&anth_msg).try_into();
+                    br_msg.ok()
+                })
+                .collect::<Vec<aws_sdk_bedrockruntime::types::Message>>()
+        };
         let res = self
             .client
             .converse()
             .model_id(MODEL_ID)
             .system(SystemContentBlock::Text(SYSTEM_PROMPT.into()))
-            .messages(
-                BedrockMessage::builder()
-                    .role(ConversationRole::User)
-                    .content(ContentBlock::Text(format!(
-                        "{}\n\n<prompt>{}</prompt>",
-                        message.free_context, message.prompt
-                    )))
-                    .build()
-                    .unwrap(),
-            )
+            .set_messages(Some(messages))
             .send()
             .await;
 
@@ -305,10 +383,12 @@ impl AiClient for BedrockClient {
                     .as_text()
                     .map_err(|_| SendMessageError::Custom("Model response was not text".into()))?;
 
-                match serde_json::from_str::<ModelResponse>(text) {
-                    Ok(_) => Ok(SendMessageResponse::Chat(text.into())),
-                    _ => Err(SendMessageError::MalformedCode(text.into())),
-                }
+                let cleaned_text = text.replace("\\n", "\\\\n");
+                history.push(StorableMessage {
+                    role: "assistant".to_string(),
+                    content: cleaned_text.clone(),
+                });
+                Ok(SendMessageResponse::Chat(cleaned_text))
             }
             Err(err) => match err {
                 aws_smithy_runtime_api::client::result::SdkError::ServiceError(service_error) => {
