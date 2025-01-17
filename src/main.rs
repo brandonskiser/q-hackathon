@@ -1,13 +1,9 @@
 use aws_config::BehaviorVersion;
-// use std::io::{IsTerminal, Read, Stdin};
 use aws_sdk_bedrockruntime::{
-    error::SdkError,
-    operation::converse::ConverseError,
-    types::{ContentBlock, ConversationRole, Message as BedrockMessage, SystemContentBlock},
-    Client,
+    error::SdkError, operation::converse::ConverseError, types::SystemContentBlock, Client,
 };
-use serde::{Deserialize, Deserializer, Serialize};
-use std::{borrow::BorrowMut, fs::File, io::IsTerminal, path::Path, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::{fs::File, io::IsTerminal, path::Path, sync::Arc};
 use thiserror::Error;
 use tokio::{io::AsyncReadExt, sync::Mutex, time::Instant};
 
@@ -30,7 +26,9 @@ struct Cli {
     #[arg(short, long)]
     file_ctx: Option<Vec<String>>,
     #[arg(short, long)]
-    resume_chat_ctx: Option<String>,
+    // This is the id associated with the conversation
+    // This is to be joined with the current_repo_dir to form current_repo_dir/.db/resume_chat_ctx
+    resume_chat_ctx: String,
     #[arg(short, long)]
     current_repo_dir: String,
 }
@@ -110,6 +108,7 @@ impl From<AnthropicMessage> for StorableMessage {
     }
 }
 
+#[allow(clippy::from_over_into)]
 impl Into<aws_sdk_bedrockruntime::types::ContentBlock> for &AnthropicContent {
     fn into(self) -> aws_sdk_bedrockruntime::types::ContentBlock {
         aws_sdk_bedrockruntime::types::ContentBlock::Text(self.text.clone())
@@ -144,7 +143,10 @@ async fn main() -> anyhow::Result<()> {
     if !current_repo_dir.is_dir() {
         anyhow::bail!("current repo directory given is invalid");
     }
-    tokio::fs::create_dir(Path::join(current_repo_dir, ".db")).await?;
+    let db_path = Path::join(current_repo_dir, ".db");
+    if !db_path.is_dir() {
+        tokio::fs::create_dir(Path::join(current_repo_dir, ".db")).await?;
+    }
 
     let mut stdin = tokio::io::stdin();
     let mut context = if std::io::stdin().is_terminal() {
@@ -173,11 +175,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let prompt = cli.prompt.join(" ");
-    let resume_ctx = cli.resume_chat_ctx.as_ref().map(Path::new);
+    let resume_ctx_path = Path::join(Path::new(".db"), &cli.resume_chat_ctx);
 
     info!("Context: {:?}", context);
 
-    let client = BedrockClient::from_id(resume_ctx, current_repo_dir).await;
+    let conversation_history_path = Path::join(current_repo_dir, resume_ctx_path);
+    let client = BedrockClient::from_id(&conversation_history_path).await;
 
     let response = {
         let start = Instant::now();
@@ -203,13 +206,6 @@ async fn main() -> anyhow::Result<()> {
     client.store_conversation().await?;
 
     Ok(())
-}
-
-async fn retrieve_existing_convo_context(id: &Path) -> anyhow::Result<String> {
-    if !id.is_file() {
-        anyhow::bail!("id given is not a file");
-    }
-    Ok(tokio::fs::read_to_string(id).await?)
 }
 
 #[derive(Debug, Clone)]
@@ -251,73 +247,53 @@ pub enum SendMessageResponse {
 }
 
 #[derive(Debug)]
-pub struct BedrockClient {
+pub struct BedrockClient<'a> {
     client: Client,
     conversation_history: Arc<Mutex<Vec<StorableMessage>>>,
-    conversation_id: Option<String>,
+    conversation_id: &'a Path,
 }
 
-impl BedrockClient {
-    pub async fn new() -> Self {
+unsafe impl Send for BedrockClient<'_> {}
+
+impl<'a> BedrockClient<'a> {
+    pub async fn from_id(convo_history_path: &'a Path) -> Self {
         let sdk_config = aws_config::defaults(BehaviorVersion::latest())
             .region(CLAUDE_REGION)
             .load()
             .await;
         let client = Client::new(&sdk_config);
 
-        Self {
-            client,
-            conversation_history: Arc::new(Mutex::new(Vec::new())),
-            conversation_id: None,
+        if !convo_history_path.is_file() {
+            if let Err(e) = tokio::fs::File::create(convo_history_path).await {
+                panic!("Error creating convo history file: {}", e);
+            }
         }
-    }
-
-    pub async fn from_id(convo_id: Option<&Path>, repo_dir: &Path) -> Self {
-        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
-            .region(CLAUDE_REGION)
-            .load()
-            .await;
-        let client = Client::new(&sdk_config);
 
         let bedrock_client = Self {
             client,
             conversation_history: Arc::new(Mutex::new(Vec::new())),
-            conversation_id: Some(".db/some_unique_id".to_string()),
+            conversation_id: convo_history_path,
         };
 
-        if let Some(convo_id) = convo_id {
-            if convo_id.is_file() {
-                if let Ok(ctx_buf) = tokio::fs::read_to_string(convo_id).await {
-                    if let Ok(mut previous_messages) =
-                        serde_json::from_str::<Vec<StorableMessage>>(&ctx_buf)
-                    {
-                        let mut history = bedrock_client.conversation_history.lock().await;
-                        history.append(&mut previous_messages);
-                    }
-                }
-            } else if let Err(e) = tokio::fs::File::create(convo_id).await {
-                panic!("Cannot create context file: {}", e);
+        if let Ok(ctx_buf) = tokio::fs::read_to_string(convo_history_path).await {
+            if let Ok(mut previous_messages) =
+                serde_json::from_str::<Vec<StorableMessage>>(&ctx_buf)
+            {
+                let mut history = bedrock_client.conversation_history.lock().await;
+                history.append(&mut previous_messages);
             }
-        } else if let Err(e) =
-            tokio::fs::File::create(Path::join(repo_dir, ".db/some_unique_id")).await
-        {
-            panic!("Cannot create context file: {}", e);
         }
 
         bedrock_client
     }
 
     pub async fn store_conversation(&self) -> anyhow::Result<()> {
-        println!("running store conversation");
-        if let Some(ctx_file_path) = &self.conversation_id {
-            let json = serde_json::to_string_pretty(&*self.conversation_history.lock().await)?;
-            println!("*****json to be written is: {}", json);
-            tokio::fs::write(ctx_file_path, json).await?;
-            return Ok(());
-        }
-        anyhow::bail!("Error storing conversation. Ctx file path not provided");
+        let json = serde_json::to_string_pretty(&*self.conversation_history.lock().await)?;
+        tokio::fs::write(self.conversation_id, json).await?;
+        Ok(())
     }
 
+    // unused for now
     pub async fn load_conversation<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
         let json = tokio::fs::read_to_string(path).await?;
         let mut history = self.conversation_history.lock().await;
@@ -329,7 +305,7 @@ impl BedrockClient {
 }
 
 #[async_trait::async_trait]
-impl AiClient for BedrockClient {
+impl AiClient for BedrockClient<'_> {
     async fn send_message(
         &self,
         message: Message,
