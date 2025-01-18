@@ -84,6 +84,8 @@ pub async fn execute_chat(args: ChatArgs) -> anyhow::Result<()> {
         }
     }
 
+    client.store_conversation().await?;
+
     Ok(())
 }
 
@@ -135,6 +137,7 @@ impl<'a> BedrockClient<'a> {
     }
 
     // unused for now
+    #[allow(dead_code)]
     pub async fn load_conversation<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
         let json = tokio::fs::read_to_string(path).await?;
         let mut history = self.conversation_history.lock().await;

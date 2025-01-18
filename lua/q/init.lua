@@ -1,3 +1,4 @@
+local file_picker = require "q.file_picker"
 local M = {}
 
 local state = {
@@ -13,7 +14,9 @@ local state = {
         chat_win = -1,
         prompt_win = -1,
         conv_id = nil,
-        messages = {}
+        files = {},
+        messages = {},
+        buf = nil,
     },
 }
 
@@ -24,7 +27,7 @@ local MOCK = false
 local TEST_FAILURE = false
 
 local cmd_name = "hackathon"
-local cmd_path = "/Volumes/workplace/hackathon/target/debug/" .. cmd_name
+local cmd_path = "/Users/dingfeli/doodle/q-hackathon/target/debug/" .. cmd_name
 
 local function debug(...)
     print(...)
@@ -120,10 +123,15 @@ local function call_chat(opts)
             stdout = mock_chat_res()
         }
     end
-    local cmd_result = vim.system({ cmd_path, 'chat', opts.prompt },
+    debug("the prompt is: " .. opts.prompt)
+    local cmd_list = { cmd_path, 'chat', opts.prompt, '-c', '.', '-r', state.chat.conv_id }
+    for _, filepath in ipairs(state.chat.files) do
+        table.insert(cmd_list, '-f')
+        table.insert(cmd_list, filepath)
+    end
+    local cmd_result = vim.system(cmd_list,
         {
             text = true,
-            stdin = opts.stdin,
             env = { RUST_LOG = 'debug' }
         }):wait()
     return cmd_result
@@ -140,13 +148,17 @@ end
 ---@param prompt string
 ---@return ChatResponse? chat_response
 local function make_chat_request(prompt)
+    table.insert(state.chat.messages, { role = 'user', message = prompt })
     local curr_buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)
     local cmd_result = call_chat({ prompt = prompt, stdin = curr_buf })
+    state.chat.files = {}
     if cmd_result.code ~= 0 then
+        debug("error encountered" .. cmd_result.stderr)
         error('chat command failed with code: ' .. cmd_result.code .. '. stderr: ' .. cmd_result.stderr)
         return
     end
-    return vim.json.decode(cmd_result.stdout)
+    debug("result returned: " .. cmd_result.stdout)
+    return { message = { role = 'assistant', message = cmd_result.stdout } }
 end
 
 ---@return string
@@ -165,7 +177,7 @@ local function call_code(opts)
             stdout = mock_code_res()
         }
     end
-    local cmd_result = vim.system({ cmd_path, 'code', opts.prompt },
+    local cmd_result = vim.system({ cmd_path, '--code', opts.prompt },
         {
             text = true,
             stdin = opts.stdin,
@@ -202,7 +214,7 @@ local function chat_messages_to_lines(messages)
     local lines = {}
     for _, v in ipairs(messages) do
         lines[#lines + 1] = '# ' .. v.role
-        local msg_lines = vim.fn.split(v.message, "\\\\n", false)
+        local msg_lines = vim.fn.split(v.message, "\n", false)
         for _, line in ipairs(msg_lines) do
             lines[#lines + 1] = line
         end
@@ -218,8 +230,8 @@ local function send_prompt()
     local ok, response = pcall(make_chat_request, prompt)
     if not ok or not response then return end
 
-    state.chat.messages = response.message
-    local lines = chat_messages_to_lines(response.message)
+    table.insert(state.chat.messages, response.message)
+    local lines = chat_messages_to_lines(state.chat.messages)
 
     local chat_buf = vim.fn.winbufnr(state.chat.chat_win)
     vim.bo[chat_buf].modifiable = true
@@ -241,6 +253,7 @@ function M.setup(opts)
             if state.chat.open then return end
 
             local chat_buf = vim.api.nvim_create_buf(false, true)
+            state.chat.buf = chat_buf
             vim.bo[chat_buf].modifiable = false
             vim.bo[chat_buf].filetype = 'markdown'
             vim.bo[chat_buf].bufhidden = 'wipe'
@@ -336,11 +349,7 @@ function M.setup(opts)
             end
 
             local ok, response = pcall(make_code_request, prompt)
-            if not ok or not response then
-                debug('request failed!' .. response)
-                return
-            end
-            debug('received response: ' .. vim.inspect(response))
+            if not ok or not response then return end
 
             -- create a new buffer to display the results
             local ai_buf = vim.api.nvim_create_buf(false, true)
@@ -412,6 +421,17 @@ function M.setup(opts)
         {
             desc = 'Make a code modification',
             nargs = '*'
+        }
+    )
+
+    vim.api.nvim_create_user_command(
+    'Qsf',
+    function()
+            file_picker.create_file_picker(state.chat.files, state.chat.buf, state.chat.chat_win)
+        end,
+        {
+          desc = 'File picker to include files as context',
+          nargs = '*'
         }
     )
 end
