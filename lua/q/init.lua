@@ -27,7 +27,8 @@ local MOCK = false
 local TEST_FAILURE = false
 
 local cmd_name = "hackathon"
-local cmd_path = "/Users/dingfeli/doodle/q-hackathon/target/debug/" .. cmd_name
+-- local cmd_path = "/Users/dingfeli/doodle/q-hackathon/target/debug/" .. cmd_name
+local cmd_path = "/Volumes/workplace/hackathon/target/debug/" .. cmd_name
 
 local function debug(...)
     print(...)
@@ -177,7 +178,7 @@ local function call_code(opts)
             stdout = mock_code_res()
         }
     end
-    local cmd_result = vim.system({ cmd_path, '--code', opts.prompt },
+    local cmd_result = vim.system({ cmd_path, 'code', opts.prompt },
         {
             text = true,
             stdin = opts.stdin,
@@ -202,7 +203,7 @@ local function make_code_request(prompt)
     local curr_buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)
     local cmd_result = call_code({ prompt = prompt, stdin = curr_buf })
     if cmd_result.code ~= 0 then
-        error('code command failed with code: ' .. cmd_result.code .. '. stderr: ' .. cmd_result.stderr)
+        debug('code command failed with code: ' .. cmd_result.code .. '. stderr: ' .. cmd_result.stderr)
         return
     end
     return vim.json.decode(cmd_result.stdout)
@@ -349,7 +350,7 @@ function M.setup(opts)
             end
 
             local ok, response = pcall(make_code_request, prompt)
-            if not ok or not response then return end
+            if not ok or not response then debug('not ok') return end
 
             -- create a new buffer to display the results
             local ai_buf = vim.api.nvim_create_buf(false, true)
