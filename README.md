@@ -2,11 +2,51 @@
 
 An AI-powdered CLI for your terminal and editor.
 
-## Examples
+The goal of our project was to explore how a binary with access to LLM-powered capabilities could be used in the command line to recreate common features found across IDE's and other higher-level AI tools. In our case, we designed the API for such a binary by creating a neovim plugin with code-modification and chat capabilities.
 
-cat src/main.rs | h 'generate tests for this file'
+## Overview
+
+This project consists of two components:
+1. A rust binary called `hackathon`
+2. A neovim plugin under `lua/`
+
+## Prerequisites
+
+1. Install Rust: https://www.rust-lang.org/tools/install
+2. Set up model access in AWS Bedrock in a personal AWS account.
+   The binary is hardcoded to use the model `anthropic.claude-3-haiku-20240307-v1:0` in region `us-west-2`.
+3. Set up credentials for calling Bedrock. This can be done with the following script which uses `ada` - see `toolbox install ada`:
+```sh
+#!/usr/bin/env sh
+
+set -e
+AWS_ACCOUNT=YOUR_AWS_ACCOUNT
+ROLE="admin"
+
+echo "Refreshing credentials for account ${AWS_ACCOUNT} with role ${ROLE}"
+ada credentials update --account="${AWS_ACCOUNT}" --provider=isengard --role="${ROLE}" --once
+```
+4. (optional) install neovim: https://github.com/neovim/neovim/blob/master/INSTALL.md
+Set this directory as a plugin in whatever plugin manager you use.
+Using Lazy:
+```lua
+{
+    dir = "~/workplace/hackathon",
+    opts = {},
+}
+```
 
 ## Usage
+
+See `cargo run -- --help` for up-to-date options.
+
+## Examples
+
+```sh
+cat src/main.rs | cargo run -- code 'generate tests for this file'
+```
+
+## Design Notes
 
 h \[options...] <PROMPT>
 
@@ -33,33 +73,4 @@ type CliOutput = {
     }>
 };
 ```
-
-
-## Examples 
-
-```sh
-h -f src/main.rs -f src/lib.rs 'add another option to subtract numbers'
-h -f src/main.rs,src/lib.rs 'jsdlfjdslk'
-h -d src 'jsdlfjdslk'
-cat src/main.rs | h 'generate tests for this file'
-```
-
-## Presentation Steps
-
-1. Give overview of the purpose of our project
-"The goal of our project was to explore how a binary with access to LLM-powered capabilities could be used
-in the command line to recreate common features found across IDE's and other higher-level AI tools."
-"In our case, we designed the API for such a binary by creating a neovim plugin with code-modification and
-chat capabilities."
-2. Show picture of how it works
-3. Demonstrate `:QCode`
-    1. In ./examples/math/: `:QCode 'add code for subtracting, multiplying, and dividing numbers'` - apply
-    2. `:QCode 'add comments explaining each function'` - exit out if not doc comments
-    3. `:QCode 'add doc comments explaining each function'` - apply
-    <!-- 4. `:QCode 'make these math functions generic'` - apply -->
-4. Demonstrate `:QChat`
-    1. In ./examples/data_structures/:
-        `:Qsf` and select all the data structure files
-        in `QChat` 'can you provide an example of how to use these data structures?'
-        'How would you use these examples as tests for each file?'
 
